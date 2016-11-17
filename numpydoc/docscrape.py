@@ -173,6 +173,9 @@ class NumpyDocString(collections.Mapping):
 
         return doc[i:len(doc)-j]
 
+    def _get_line_no(self):
+        return self._doc._l
+
     def _read_to_next_section(self):
         section = self._doc.read_to_next_empty_line()
 
@@ -186,20 +189,22 @@ class NumpyDocString(collections.Mapping):
 
     def _read_sections(self):
         while not self._doc.eof():
+            start = self._get_line_no()
             data = self._read_to_next_section()
             name = data[0].strip()
 
             if name.startswith('..'):  # index section
-                yield name, data[1:]
+                yield name, data[1:], (start, len(data))
             elif len(data) < 2:
                 yield StopIteration
             else:
-                yield name, self._strip(data[2:])
+                yield name, self._strip(data[2:]), (start, len(data))
 
     def _parse_param_list(self, content):
         r = Reader(content)
         params = []
         while not r.eof():
+            start = r._l
             header = r.read().strip()
             if ' : ' in header:
                 arg_name, arg_type = header.split(' : ')[:2]
@@ -209,7 +214,7 @@ class NumpyDocString(collections.Mapping):
             desc = r.read_to_next_unindented_line()
             desc = dedent_lines(desc)
 
-            params.append((arg_name, arg_type, desc))
+            params.append((arg_name, arg_type, desc, (start, len(desc) + 1)))
 
         return params
 
@@ -315,9 +320,10 @@ class NumpyDocString(collections.Mapping):
     def _parse(self):
         self._doc.reset()
         self._parse_summary()
+        self._line_spans = {}
 
         sections = list(self._read_sections())
-        section_names = set([section for section, content in sections])
+        section_names = set([section for section, content, span in sections])
 
         has_returns = 'Returns' in section_names
         has_yields = 'Yields' in section_names
@@ -326,7 +332,7 @@ class NumpyDocString(collections.Mapping):
             msg = 'Docstring contains both a Returns and Yields section.'
             raise ValueError(msg)
 
-        for (section, content) in sections:
+        for (section, content, span) in sections:
             if not section.startswith('..'):
                 section = (s.capitalize() for s in section.split(' '))
                 section = ' '.join(section)
@@ -335,10 +341,19 @@ class NumpyDocString(collections.Mapping):
                            section)
                     raise ValueError(msg)
 
+            self._line_spans[section] = span
+            section_start = span[0] + 2
+
             if section in ('Parameters', 'Returns', 'Yields', 'Raises',
                            'Warns', 'Other Parameters', 'Attributes',
                            'Methods'):
-                self[section] = self._parse_param_list(content)
+                param_list = []
+                for i, param in enumerate(self._parse_param_list(content)):
+                    span = param[-1]
+                    span = (span[0] + section_start, span[1])
+                    self._line_spans[section, i] = span
+                    param_list.append(param[:-1])
+                self[section] = param_list
             elif section.startswith('.. index::'):
                 self['index'] = self._parse_index(section, content)
             elif section == 'See Also':
