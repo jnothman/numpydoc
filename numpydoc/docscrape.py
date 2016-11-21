@@ -171,7 +171,7 @@ class NumpyDocString(collections.Mapping):
             if line.strip():
                 break
 
-        return doc[i:len(doc)-j]
+        return doc[i:len(doc)-j], i, j
 
     def _get_line_no(self):
         return self._doc._l
@@ -188,17 +188,21 @@ class NumpyDocString(collections.Mapping):
         return section
 
     def _read_sections(self):
+        """
+        Generates (heading, content, (start, length, head_length))
+        """
         while not self._doc.eof():
             start = self._get_line_no()
             data = self._read_to_next_section()
             name = data[0].strip()
 
             if name.startswith('..'):  # index section
-                yield name, data[1:], (start, len(data))
+                yield name, data[1:], (start, len(data), 1)
             elif len(data) < 2:
                 yield StopIteration
             else:
-                yield name, self._strip(data[2:]), (start, len(data))
+                stripped, n_pre, n_post = self._strip(data[2:])
+                yield name, stripped, (start, len(data), n_pre + 2)
 
     def _parse_param_list(self, content):
         r = Reader(content)
@@ -212,9 +216,10 @@ class NumpyDocString(collections.Mapping):
                 arg_name, arg_type = header, ''
 
             desc = r.read_to_next_unindented_line()
+            length = r._l - start
             desc = dedent_lines(desc)
 
-            params.append((arg_name, arg_type, desc, (start, len(desc) + 1)))
+            params.append((arg_name, arg_type, desc, (start, length)))
 
         return params
 
@@ -341,8 +346,9 @@ class NumpyDocString(collections.Mapping):
                            section)
                     raise ValueError(msg)
 
-            self._line_spans[section] = span
-            section_start = span[0] + 2
+            section_start, section_length, head_length = span
+            self._line_spans[section] = (section_start, section_length)
+            param_list_start = section_start + head_length
 
             if section in ('Parameters', 'Returns', 'Yields', 'Raises',
                            'Warns', 'Other Parameters', 'Attributes',
@@ -350,7 +356,7 @@ class NumpyDocString(collections.Mapping):
                 param_list = []
                 for i, param in enumerate(self._parse_param_list(content)):
                     span = param[-1]
-                    span = (span[0] + section_start, span[1])
+                    span = (span[0] + param_list_start, span[1])
                     self._line_spans[section, i] = span
                     param_list.append(param[:-1])
                 self[section] = param_list
