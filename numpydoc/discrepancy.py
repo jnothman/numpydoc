@@ -1,11 +1,234 @@
 import re
 import difflib
-import pydoc
 import inspect
 import importlib
 import sys
 
 from .docscrape import NumpyDocString
+
+
+def _get_doc_indent(doc):
+    """Calculate indentation for docstring.
+
+    Any whitespace that can be uniformly removed from the second line
+    onwards is removed.
+
+    Modified from CPython's inspect.cleandoc
+    """
+    try:
+        lines = doc.expandtabs().split('\n')
+    except UnicodeError:
+        return None
+    else:
+        # Find minimum indentation of any non-blank lines after first line.
+        margin = sys.maxsize
+        for line in lines[1:]:
+            content = len(line.lstrip())
+            if content:
+                indent = len(line) - content
+                margin = min(margin, indent)
+        # Remove indentation.
+        if margin == sys.maxsize:
+            margin = 0
+        return margin
+
+
+def _findclass(func):
+    """
+
+    From CPython's inspect module.
+    """
+    cls = sys.modules.get(func.__module__)
+    if cls is None:
+        return None
+    for name in func.__qualname__.split('.')[:-1]:
+        cls = getattr(cls, name)
+    if not inspect.isclass(cls):
+        return None
+    return cls
+
+
+def _finddoc_obj(obj):
+    """
+
+    From CPython's inspect module.
+    """
+    try:
+        doc = obj.__doc__
+    except AttributeError:
+        return None
+    if doc is not None:
+        return obj
+
+    if inspect.isclass(obj):
+        for base in obj.__mro__:
+            if base is not object:
+                try:
+                    doc = base.__doc__
+                except AttributeError:
+                    continue
+                if doc is not None:
+                    return base
+        return None
+
+    if inspect.ismethod(obj):
+        name = obj.__func__.__name__
+        self = obj.__self__
+        if inspect.isclass(self) and \
+           getattr(getattr(self, name, None), '__func__') is obj.__func__:
+            # classmethod
+            cls = self
+        else:
+            cls = self.__class__
+    elif inspect.isfunction(obj):
+        name = obj.__name__
+        cls = _findclass(obj)
+        if cls is None or getattr(cls, name) is not obj:
+            return None
+    elif inspect.isbuiltin(obj):
+        name = obj.__name__
+        self = obj.__self__
+        if inspect.isclass(self) and \
+           self.__qualname__ + '.' + name == obj.__qualname__:
+            # classmethod
+            cls = self
+        else:
+            cls = self.__class__
+    # Should be tested before isdatadescriptor().
+    elif isinstance(obj, property):
+        func = obj.fget
+        name = func.__name__
+        cls = _findclass(func)
+        if cls is None or getattr(cls, name) is not obj:
+            return None
+    elif self.ismethoddescriptor(obj) or self.isdatadescriptor(obj):
+        name = obj.__name__
+        cls = obj.__objclass__
+        if getattr(cls, name) is not obj:
+            return None
+    else:
+        return None
+
+    for base in cls.__mro__:
+        try:
+            doc = getattr(base, name).__doc__
+        except AttributeError:
+            continue
+        if doc is not None:
+            return base
+    return None
+
+
+def get_docstring_source(obj, check_match=True):
+    """Attempts to locate the docstring for an object in source code
+
+    Parameters
+    ----------
+    obj : object
+        Object with the target docstring
+    check_match : bool
+        If True (default), raises an error if the docstring and that found do
+        not exactly match.
+
+    Returns
+    -------
+    resolved_obj : object
+        The object where the input object has its docstring defined
+    match_groups : dict
+        Keys 'prefix', 'content' and 'suffix' split the ``resolved_obj``'s code
+        into the docstring content and that which precedes and follows it.
+    """
+    resolved_obj = _finddoc_obj(obj)
+    orig_doc = resolved_obj.__doc__
+    if orig_doc is None:
+        raise ValueError('Could not find __doc__ for {0!r}'.format(obj))
+
+    lines, file_offset = inspect.getsourcelines(obj)
+    orig_code = ''.join(lines)
+
+    # This is a brittle way to find the docstring:
+    # * only admits a single triple-quoted string
+    # * assumes the first triple-quoted string in the function definition
+    #   (including signature) is docstring
+    # * does not handle escaping
+    match = re.search(r'''
+      ^
+      (?P<prefix>
+        .*?
+        ^\s+[uU]?[rR]?(?P<quote>"""|''\')
+        \s*
+      )
+      (?P<content>\S.*?)
+      (?P<suffix>
+        \s*
+        (?P=quote)
+        .*
+      )
+      $
+      ''', orig_code, re.MULTILINE | re.DOTALL | re.VERBOSE)
+    if match is None:
+        raise NotImplementedError('Could not get __doc__ by regex.')
+    if check_match and orig_doc.strip() != match.group('content'):
+        raise NotImplementedError('Could not match __doc__ by regex.'
+                                  'This may be due to use of \\ escapes.')
+    return match.groupdict()
+
+
+def get_docstring_line_range(obj, check_match=True):
+    """
+
+    Parameters
+    ----------
+    obj : object
+        Object with the target docstring
+    check_match : bool
+        If True (default), raises an error if the docstring and that found do
+        not exactly match.
+
+    Returns
+    -------
+    path : str
+        Path to file where obj's docstring is defined
+    start_line : int
+        Line number where obj's docstring begins
+    stop_line : int
+        Line number of closing quote for docstring
+    """
+    resolved_obj, match = get_docstring_source(obj, check_match=check_match)
+    path = inspect.getsourcefile(obj)
+    _, file_offset = inspect.getsourcelines(obj)
+    start = file_offset + match['prefix'].count('\n')
+    stop = start + match['content'].count('\n')
+    return path, start, stop
+
+
+def build_docstring_diff(obj, updated_docstring, path=None):
+    resolved_obj, match = get_docstring_source(obj)
+    orig_doc = resolved_obj.__doc__
+
+    prefix = match['prefix']
+    suffix = match['suffix']
+    indent = ' ' * _get_doc_indent(orig_doc)
+
+    if path is None:
+        path = inspect.getsourcefile(resolved_obj)
+
+    lines, file_offset = inspect.getsourcelines(obj)
+    file_offset = '\n' * (file_offset - 1)
+    diff_from = file_offset + ''.join(lines)
+    updated_lines = updated_docstring.split('\n')
+    if updated_lines:
+        updated_lines = updated_lines[:1] + [indent + l
+                                             for l in updated_lines[1:]]
+        out_doc = '\n'.join(updated_lines)
+    else:
+        out_doc = ''
+    diff_to = file_offset + prefix + out_doc + suffix
+    diff = difflib.unified_diff(diff_from.split('\n'), diff_to.split('\n'),
+                                fromfile='a/' + path, tofile='b/' + path,
+                                lineterm='',
+                                n=2)  # n=2 should work for a non-empty obj
+    return '\n'.join(diff)
 
 
 def get_param_diff(obj, positional=(), keyword=(), section='Parameters',
@@ -41,29 +264,13 @@ def get_param_diff(obj, positional=(), keyword=(), section='Parameters',
                          'non-overlapping. Found intersection %s' %
                          keyword.intersection(positional))
 
-    lines, file_offset = inspect.getsourcelines(obj)
-
-    # identify the offset of the docstring within `lines`
-    for docstring_offset, l in enumerate(lines):
-        # XXX: a brittle heuristic
-        if re.match(r'\s+(\'\'\'|""")', l):
-            docstring_indent = len(l) - len(l.lstrip())
-            break
-    else:
-        raise ValueError('Failed to find docstring start for %s' % obj)
-    new_name_fmt = ' ' * docstring_indent + '%s' + '\n'
-
-    if path is None:
-        path = inspect.getsourcefile(obj)
-
-    # TODO?: some validation that our offset matches getdoc
-
-    parsed_docstring = NumpyDocString(pydoc.getdoc(obj))
+    orig_doc = inspect.getdoc(obj)
+    parsed_docstring = NumpyDocString(orig_doc)
+    lines = orig_doc.split('\n')
 
     def get_lines(idx):
         start, length = parsed_docstring._line_spans[section, idx]
-        return lines[start + docstring_offset:
-                     start + length + docstring_offset]
+        return lines[start:start + length]
 
     section_start, param_list_length = parsed_docstring._line_spans[section]
     param_list_stop = section_start + param_list_length
@@ -72,7 +279,7 @@ def get_param_diff(obj, positional=(), keyword=(), section='Parameters',
     except KeyError:
         # No params yet
         param_list_start = param_list_stop
-    out = lines[:param_list_start + docstring_offset]
+    out = lines[:param_list_start]
     name_to_idx = dict((name, i)
                        for i, (name, _, _)
                        in enumerate(parsed_docstring[section]))
@@ -83,7 +290,7 @@ def get_param_diff(obj, positional=(), keyword=(), section='Parameters',
             out.extend(get_lines(name_to_idx[name]))
         else:
             # Insert: line contains name only
-            out.append(new_name_fmt % name)
+            out.append(name)
 
     # matched keywords
     positional = set(positional)
@@ -97,17 +304,14 @@ def get_param_diff(obj, positional=(), keyword=(), section='Parameters',
         out.extend(get_lines(i))
 
     # Insert remaining keywords
-    out.extend(new_name_fmt % name for name in sorted(keyword))
+    out.extend(name for name in sorted(keyword))
 
-    # Be careful about following as may need to include closing of docstring
+    # FIXME: Be careful about following as may need to include closing of
+    # docstring
 
-    out.extend(lines[param_list_stop + docstring_offset:])
-    file_offset = ['\n'] * (file_offset - 1)
-    diff = difflib.unified_diff(file_offset + lines,
-                                file_offset + out,
-                                fromfile='a/' + path, tofile='b/' + path,
-                                n=2)  # n=2 should work for any non-empty obj
-    return ''.join(diff)
+    out.extend(lines[param_list_stop:])
+
+    return build_docstring_diff(obj, '\n'.join(out), path=path)
 
 
 def diff_parameters(obj, all_positional=False, remove=(), path=None):
