@@ -1,3 +1,4 @@
+import os
 import re
 import difflib
 import inspect
@@ -167,11 +168,12 @@ def get_docstring_source(obj, check_match=True):
       $
       ''', orig_code, re.MULTILINE | re.DOTALL | re.VERBOSE)
     if match is None:
-        raise NotImplementedError('Could not get __doc__ by regex.')
+        raise NotImplementedError('Could not get __doc__ by regex for '
+                                  '{0}.'.format(obj))
     if check_match and orig_doc.strip() != match.group('content'):
         raise NotImplementedError('Could not match __doc__ by regex.'
                                   'This may be due to use of \\ escapes.')
-    return match.groupdict()
+    return resolved_obj, match.groupdict()
 
 
 def get_docstring_line_range(obj, check_match=True):
@@ -202,7 +204,7 @@ def get_docstring_line_range(obj, check_match=True):
     return path, start, stop
 
 
-def build_docstring_diff(obj, updated_docstring, path=None):
+def build_docstring_diff(obj, updated_docstring, path_base=None):
     resolved_obj, match = get_docstring_source(obj)
     orig_doc = resolved_obj.__doc__
 
@@ -210,15 +212,14 @@ def build_docstring_diff(obj, updated_docstring, path=None):
     suffix = match['suffix']
     indent = ' ' * _get_doc_indent(orig_doc)
 
-    if path is None:
-        path = inspect.getsourcefile(resolved_obj)
+    path = os.path.relpath(inspect.getsourcefile(resolved_obj), path_base)
 
     lines, file_offset = inspect.getsourcelines(obj)
     file_offset = '\n' * (file_offset - 1)
     diff_from = file_offset + ''.join(lines)
     updated_lines = updated_docstring.split('\n')
     if updated_lines:
-        updated_lines = updated_lines[:1] + [indent + l
+        updated_lines = updated_lines[:1] + [indent + l if l else ''
                                              for l in updated_lines[1:]]
         out_doc = '\n'.join(updated_lines)
     else:
@@ -232,7 +233,7 @@ def build_docstring_diff(obj, updated_docstring, path=None):
 
 
 def get_param_diff(obj, positional=(), keyword=(), section='Parameters',
-                   path=None):
+                   path_base=None):
     """Propose changes to the docstring to match requirements
 
     Parameters
@@ -244,8 +245,8 @@ def get_param_diff(obj, positional=(), keyword=(), section='Parameters',
         Sought keyword argument names for arbitrary order
     section : str, optional
         A :class:`NumpyDocString` section key which indicates a parameter list.
-    path : str, optional
-        The path that the diff is to patch. Defaults to source file.
+    path_base : str, optional
+        Report paths relative to this base.
 
     Returns
     -------
@@ -306,15 +307,12 @@ def get_param_diff(obj, positional=(), keyword=(), section='Parameters',
     # Insert remaining keywords
     out.extend(name for name in sorted(keyword))
 
-    # FIXME: Be careful about following as may need to include closing of
-    # docstring
-
     out.extend(lines[param_list_stop:])
 
-    return build_docstring_diff(obj, '\n'.join(out), path=path)
+    return build_docstring_diff(obj, '\n'.join(out), path_base=path_base)
 
 
-def diff_parameters(obj, all_positional=False, remove=(), path=None):
+def diff_parameters(obj, all_positional=False, remove=(), path_base=None):
     """Return a diff that updates docstring Parameters to the argspec
 
     Parameters
@@ -327,8 +325,8 @@ def diff_parameters(obj, all_positional=False, remove=(), path=None):
     remove : collection of str
         These keyword arguments should not be documented despite appearing in
         argspec.
-    path : str, optional
-        The path that the diff is to patch. Defaults to source file.
+    path_base : str, optional
+        Report paths relative to this base.
 
     Returns
     -------
@@ -369,10 +367,53 @@ def diff_parameters(obj, all_positional=False, remove=(), path=None):
     keyword -= remove
 
     return get_param_diff(obj, positional=positional, keyword=keyword,
-                          path=path)
+                          path_base=path_base)
 
 
-def diff_member_parameters(module, all_positional=False, remove=(), path=None):
+def lint_colons(doc):
+    """Finds parameters where it appears a space before colon has been elided
+
+    Parameters
+    ----------
+    doc : str or NumpyDocString
+        The docstring to be linted
+
+    Returns
+    -------
+    correction_gen : generator
+        Generates tuple of:
+            * line_number_in_doc : int
+            * old_param_name : str
+            * corrected_param_name_text : str
+    """
+    if not isinstance(doc, NumpyDocString):
+        doc = NumpyDocString(doc)
+    for heading in doc.PARAM_LIST_SECTIONS:
+        section = doc[heading]
+        if not section:
+            pass
+        for i, (name, arg_type, _) in enumerate(section):
+            if not arg_type and ': ' in name:
+                pos = name.index(': ')
+                line = doc._line_spans[heading, i][0]
+                yield line, name, name[:pos] + ' ' + name[pos:]
+
+
+def diff_lint_colons(obj, path_base=None):
+    doc = inspect.getdoc(obj)
+    if not doc:
+        return
+    changes = lint_colons(doc)
+    lines = doc.split('\n')
+    for line_no, broken, fixed in changes:
+        line = lines[line_no]
+        assert broken in line
+        lines[line_no] = line.replace(broken, fixed, 1)
+
+    return build_docstring_diff(obj, '\n'.join(lines), path_base=path_base)
+
+
+def diff_member_parameters(module, all_positional=False, remove=(), path_base=None):
     """
     Parameters
     ----------
@@ -384,8 +425,8 @@ def diff_member_parameters(module, all_positional=False, remove=(), path=None):
     remove : collection of str
         These keyword arguments should not be documented despite appearing in
         argspec.
-    path : str, optional
-        The path that the diff is to patch. Defaults to source file per object.
+    path_base : str, optional
+        Report paths relative to this base.
 
     Reuturns
     --------
@@ -395,9 +436,21 @@ def diff_member_parameters(module, all_positional=False, remove=(), path=None):
 
     def append_diff(obj):
         try:
-            diff = diff_parameters(obj, all_positional=all_positional,
-                                   remove=remove, path=path)
+###            diff = diff_parameters(obj, all_positional=all_positional,
+###                                   remove=remove, path_base=path_base)
+            diff = diff_lint_colons(obj)
+        except KeyError:
+            # sometimes this is section missing
+            return
+        except NotImplementedError:
+            return
+        except OSError:
+            # source code not available
+            return
         except Exception:
+            import traceback
+            traceback.print_exc()
+
             # TODO: raise warning
             return
 
@@ -428,9 +481,14 @@ def diff_member_parameters(module, all_positional=False, remove=(), path=None):
 def main():
     """Print parameter diffs for the modules listed on the command-line
     """
-    for name in sys.argv[1:]:
+    import argparse
+    ap = argparse.ArgumentParser()
+    ap.add_argument('modules', nargs='+')
+    ap.add_argument('--path-base', default=None)
+    args = ap.parse_args()
+    for name in args.modules:
         module = importlib.import_module(name)
-        sys.stdout.write(diff_member_parameters(module))
+        sys.stdout.write(diff_member_parameters(module, path_base=args.path_base))
 
 
 if __name__ == '__main__':

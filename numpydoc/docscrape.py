@@ -17,6 +17,7 @@ class Reader(object):
     """A line-based string reader.
 
     """
+
     def __init__(self, data):
         """
         Parameters
@@ -117,6 +118,10 @@ class NumpyDocString(collections.Mapping):
         'Examples': '',
         'index': {}
     }
+
+    PARAM_LIST_SECTIONS = ('Parameters', 'Returns', 'Yields', 'Raises',
+                           'Warns', 'Other Parameters', 'Attributes',
+                           'Methods')
 
     def __init__(self, docstring, config={}):
         orig_docstring = docstring
@@ -350,9 +355,7 @@ class NumpyDocString(collections.Mapping):
             self._line_spans[section] = (section_start, section_length)
             param_list_start = section_start + head_length
 
-            if section in ('Parameters', 'Returns', 'Yields', 'Raises',
-                           'Warns', 'Other Parameters', 'Attributes',
-                           'Methods'):
+            if section in self.PARAM_LIST_SECTIONS:
                 param_list = []
                 for i, param in enumerate(self._parse_param_list(content)):
                     span = param[-1]
